@@ -3,6 +3,14 @@ import 'fake-indexeddb/auto';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react';
 
+// jsdom 未实现对象 URL，交付包释放下载会调用；这里给出安全桩
+if (!URL.createObjectURL) {
+  URL.createObjectURL = vi.fn(() => 'blob:mock-dcp');
+}
+if (!URL.revokeObjectURL) {
+  URL.revokeObjectURL = vi.fn();
+}
+
 // 在 jsdom 中把 Worker 客户端替换为直接调用领域实现（Worker 本身由 vite build 单独打包验证）
 vi.mock('./state/workerClient', () => ({
   workerApi: {
@@ -67,6 +75,43 @@ describe('浏览器全流程冒烟（jsdom + IndexedDB）', () => {
     await clickButton(/运行投影自检/);
     await bodyMatches(/施工方仅得到本标段\(B1\) 3 条缺陷/);
     expect(document.body.textContent).toMatch(/低于检出限/);
+
+    // 3.5) 语义门禁：全量消费方（含错误消费者）→ 暂停交付 → 释放被拦截 → 只留合规消费方 → 通过 → 释放成功
+    fireEvent.click(screen.getByRole('button', { name: /语义门禁/ }));
+    await screen.findByText(/语义行为契约（机器可执行的不变量声明）/);
+    await bodyMatches(/受控基准输入集/);
+    expect(document.body.textContent).toMatch(/sb-2026\.1/);
+    await clickButton(/运行语义交付门禁/);
+    await bodyMatches(/DELIVERY_HOLD/);
+    expect(document.body.textContent).toMatch(/暂停交付原因/);
+    expect(document.body.textContent).toMatch(/单位误读消费方/);
+
+    // 暂停交付期间，签名交付包释放闸门必须拦截（结构签名相同也不放行）
+    fireEvent.click(screen.getByRole('button', { name: /签名交付包/ }));
+    await bodyMatches(/物化并签名新包/);
+    fireEvent.click((await screen.findAllByRole('button', { name: /复核并释放/ }))[0]);
+    await bodyMatches(/语义交付门禁处于/, 10000);
+
+    // 回到语义门禁，仅保留合规消费方后重跑 → 通过
+    fireEvent.click(screen.getByRole('button', { name: /语义门禁/ }));
+    // 选择器内 6 个复选框按 SIMULATED_CONSUMERS 顺序排列，第 1 个为合规消费方（保留）
+    const consumerCheckboxes = screen.getAllByRole('checkbox');
+    expect(consumerCheckboxes).toHaveLength(6);
+    for (let i = 1; i < consumerCheckboxes.length; i++) {
+      fireEvent.click(consumerCheckboxes[i]);
+    }
+    await clickButton(/运行语义交付门禁/);
+    await bodyMatches(/PASS · 语义可交付/);
+
+    // 门禁通过后释放成功（真实触发下载桩）
+    fireEvent.click(screen.getByRole('button', { name: /签名交付包/ }));
+    await bodyMatches(/物化并签名新包/);
+    fireEvent.click((await screen.findAllByRole('button', { name: /复核并释放/ }))[0]);
+    await bodyMatches(/已释放（第/, 10000);
+
+    // 回到场景页继续剧本
+    fireEvent.click(screen.getByRole('button', { name: /场景推演/ }));
+    await screen.findByText(/端到端场景推演/);
 
     // 4) 离线写入固定ID意见
     await clickButton(/切离线并写入意见/);

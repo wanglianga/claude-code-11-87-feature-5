@@ -11,6 +11,7 @@ import type {
   ReceiptDraft,
   ReceiptType,
   ReviewComment,
+  SemanticGateReport,
   ServerState,
 } from '../types';
 import { ACCOUNTS, buildSeedServerState, getAttachments, PENDING_R2 } from '../domain/seed';
@@ -21,10 +22,13 @@ import { ledgerKeyOf } from '../domain/receipts';
 import { mergeOfflineComments, resolveCommentConflict } from '../domain/merge';
 import { applyReReviewFlag } from '../domain/merge';
 import { uid } from '../domain/hash';
+import { buildSemanticBenchmark } from '../domain/semantic/benchmark';
+import { runSemanticGate } from '../domain/semantic/gate';
+import { SIMULATED_CONSUMERS, getConsumerDef } from '../domain/semantic/consumers';
 import { workerApi } from './workerClient';
 import { idbBulkPut, idbDelete, idbGetAll, idbPut, kvGet, kvSet, STORES, wipeAll } from '../db/idb';
 
-export type TabKey = 'scenario' | 'studio' | 'packages' | 'review' | 'receipts' | 'history' | 'contracts';
+export type TabKey = 'scenario' | 'studio' | 'packages' | 'review' | 'receipts' | 'history' | 'contracts' | 'semantic';
 
 interface Notice {
   kind: 'ok' | 'err' | 'info';
@@ -44,6 +48,8 @@ interface StoreState {
   packages: DeliveryPackage[];
   audit: AuditEvent[];
   notice: Notice | null;
+  /** 最近一次语义交付门禁报告（持久化；delivery_hold 时释放闸门强制拦截） */
+  semanticGate: SemanticGateReport | null;
 }
 
 export interface MaterializeResult {
@@ -72,6 +78,9 @@ interface StoreValue extends StoreState {
   rebuildPackage: (packageId: string) => Promise<MaterializeResult>;
   revalidatePackage: (packageId: string) => Promise<import('../types').ValidationReport>;
   tamperPackage: (packageId: string) => Promise<void>;
+
+  /** 运行语义交付门禁：对模拟消费方执行冻结绑定校验 + 差分回放 + 变形测试 */
+  runSemanticGate: (consumerIds?: string[]) => Promise<SemanticGateReport>;
 
   saveComment: (
     input: { commentId?: string; defectId: string; body: string; baseline: ReviewComment['baseline'] },
@@ -115,6 +124,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     packages: [],
     audit: [],
     notice: null,
+    semanticGate: null,
   });
 
   // 始终保存最新在线状态，避免“同一事件中先 setOnline 再调用动作”读到旧闭包
@@ -142,6 +152,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         idbGetAll<AuditEvent>(STORES.audit),
       ]);
       audit = audit.sort((a, b) => +new Date(b.at) - +new Date(a.at));
+      const semanticGate = await kvGet<SemanticGateReport>('semanticGate');
 
       // 首次运行：预物化三个角色的 R1 修订1 签名交付包
       if (packages.length === 0) {
@@ -164,6 +175,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         receipts,
         packages,
         audit,
+        semanticGate: semanticGate ?? null,
         sessionAccountId: sessionAccountId ?? null,
       }));
     })();
@@ -467,6 +479,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return { ok: false, message };
       }
 
+      // 拦截规则3（语义门禁）：结构签名相同但输出违反单位/空值等不变量时，暂停交付
+      const semanticHold = state.semanticGate?.verdict === 'delivery_hold';
+      if (semanticHold) {
+        const message =
+          '语义交付门禁处于“暂停交付”：存在消费方在同一版本冻结样本上违反单位/空值/枚举/过滤/聚合不变量（结构签名可能完全相同）。须修复语义分歧并重跑门禁通过后方可释放。';
+        pkg.status = 'release_blocked';
+        await idbPut(STORES.packages, pkg);
+        setState((s) => ({ ...s, packages: s.packages.map((p) => (p.packageId === pkg.packageId ? { ...pkg } : p)) }));
+        await pushAudit({
+          type: 'package_release_blocked',
+          actorAccountId: account?.accountId ?? pkg.receiverAccountId,
+          actorName: account?.displayName ?? pkg.receiverName,
+          summary: `包 ${pkg.packageId} 释放被语义门禁拦截：${state.semanticGate?.holdReasons.length ?? 0} 项语义不变量问题。`,
+          detail: { semanticGateReportId: state.semanticGate?.reportId, holdReasons: state.semanticGate?.holdReasons },
+          signedDeliverySummary: {
+            packageId: pkg.packageId,
+            reportHash: pkg.reportHash,
+            signature: pkg.signature,
+            receiverAccountId: pkg.receiverAccountId,
+            revision: pkg.revision,
+          },
+        });
+        return { ok: false, message };
+      }
+
       // 规则3：完整性实时校验（签名/哈希/附件）
       const rev = report.revisions.find((r) => r.revision === pkg.revision)!;
       const validation = await workerApi.validate(pkg, {
@@ -506,7 +543,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       });
       return { ok: true, message: `已释放（第 ${pkg.downloadCount} 次交付）。`, pkg };
     },
-    [state.server, state.packages, state.attachments, account, pushAudit],
+    [state.server, state.packages, state.attachments, state.semanticGate, account, pushAudit],
   );
 
   const rebuildPackage = useCallback(
@@ -576,6 +613,42 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       notify('info', '已模拟篡改包内容，请重新校验以查看签名失败。');
     },
     [state.packages, notify],
+  );
+
+  // ---------------- 语义交付门禁 ----------------
+  const runSemanticGateAction = useCallback(
+    async (consumerIds?: string[]): Promise<SemanticGateReport> => {
+      const at = nowIso();
+      const benchmark = await buildSemanticBenchmark();
+      const ids = consumerIds && consumerIds.length > 0 ? consumerIds : SIMULATED_CONSUMERS.map((c) => c.id);
+      const consumers = ids.map((id) => getConsumerDef(id).profile);
+      const report = await runSemanticGate({ benchmark, consumers, atIso: at });
+      await kvSet('semanticGate', report);
+      setState((s) => ({ ...s, semanticGate: report }));
+      await pushAudit({
+        type: report.verdict === 'pass' ? 'semantic_gate_passed' : 'semantic_gate_hold',
+        actorAccountId: account?.accountId ?? 'u-admin',
+        actorName: account?.displayName ?? '平台交付管理员',
+        summary:
+          report.verdict === 'pass'
+            ? `语义交付门禁通过：样本 ${report.benchmarkVersion} 冻结绑定一致，${consumers.length} 个消费方差分回放与变形测试全部满足不变量。`
+            : `语义交付门禁暂停交付：${report.holdReasons.length} 项语义问题（结构签名可能完全相同，但单位/空值/枚举/过滤/聚合不变量被违反）。`,
+        detail: {
+          benchmarkVersion: report.benchmarkVersion,
+          benchmarkHash: report.benchmarkHash,
+          verdict: report.verdict,
+          holdReasons: report.holdReasons,
+          consumers: ids,
+        },
+      });
+      if (report.verdict === 'delivery_hold') {
+        notify('err', '语义门禁：暂停交付。请按差异解释修复消费方语义后重跑门禁。');
+      } else {
+        notify('ok', '语义门禁通过：消费语义符合契约，可正常交付。');
+      }
+      return report;
+    },
+    [account, pushAudit, notify],
   );
 
   // ---------------- 离线意见 ----------------
@@ -861,6 +934,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     rebuildPackage,
     revalidatePackage,
     tamperPackage,
+    runSemanticGate: runSemanticGateAction,
     saveComment,
     syncComments,
     resolveConflict,

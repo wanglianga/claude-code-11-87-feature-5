@@ -22,6 +22,8 @@ const AUDIT_ICON: Record<AuditEvent['type'], string> = {
   receipt_registered: '🧾',
   conflict_adjudicated: '⚖️',
   offline_edit_blocked: '🔒',
+  semantic_gate_hold: '🛂',
+  semantic_gate_passed: '✅',
 };
 
 export default function History() {

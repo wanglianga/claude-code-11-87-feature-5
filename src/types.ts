@@ -429,7 +429,9 @@ export type AuditEventType =
   | 'comments_merged'
   | 'receipt_registered'
   | 'conflict_adjudicated'
-  | 'offline_edit_blocked';
+  | 'offline_edit_blocked'
+  | 'semantic_gate_hold'
+  | 'semantic_gate_passed';
 
 export interface AuditEvent {
   eventId: string;
@@ -461,3 +463,236 @@ export interface ServerState {
 }
 
 export const CONTRACT_VERSION = 'fc-2026.1';
+
+// ============================================================
+// 语义行为契约 / 基准样本 / 观测探针 / 差分回放 / 变形测试 / 交付门禁
+// 解决“结构签名相同但单位、缺失值或枚举语义被消费方解释错”的问题：
+// 结构校验只能证明字段还在，语义门禁证明字段的含义没有被破坏。
+// ============================================================
+
+/** 不变量类别：对应题目要求的单位换算 / 空值 / 舍入 / 过滤 / 聚合五类 */
+export type InvariantKind = 'unit' | 'null' | 'rounding' | 'filter' | 'aggregation' | 'enum';
+
+/** 空值处理纪律 */
+export type NullPolicy =
+  | 'preserve_null' // 必须保留 null 的业务含义，禁止替换为 0 / 空串 / 纪元时间 / 默认枚举
+  | 'not_applicable'; // 非可空字段
+
+/** 单个字段的机器可执行语义行为契约（由 FIELD_CONTRACTS 派生 + 补充行为不变量） */
+export interface SemanticFieldContract {
+  fieldKey: string;
+  label: string;
+  valueType: FieldValueType;
+  /** 契约基准单位（如 mm / m）；无单位字段为 undefined */
+  canonicalUnit?: string;
+  /**
+   * 单位换算不变量：消费方若以其他单位接收，必须声明的乘性换算因子。
+   * 例：crackWidthMm 以 m 接收时 factor=0.001；探针据此验证“单位缩放后数值不变量”。
+   * 无单位字段不声明。
+   */
+  unitConversions?: { unit: string; factor: number }[];
+  scale?: number;
+  detectionLimit?: number;
+  nullPolicy: NullPolicy;
+  /** 枚举合法值域（结构类型 string 但语义只允许其中之一） */
+  enumDomain?: string[];
+  /** 舍入不变量：投影值小数位不得超过契约 scale，且先判检出限再舍入 */
+  roundingInvariant: boolean;
+  /** 过滤不变量：未授权实体/字段必须整体缺省，消费方不得用默认值补位 */
+  filterInvariant: boolean;
+  /** 聚合不变量：参与统计时 null / 低于检出限值不得按 0 计入；描述聚合口径 */
+  aggregationRule?: string;
+  /** 人类可读的不变量声明（门禁报告直接展示） */
+  invariantStatements: { kind: InvariantKind; statement: string }[];
+}
+
+/** 受控样本中单条缺陷记录（源单位原始读数，故意覆盖各类语义边界） */
+export interface BenchmarkDefect {
+  defectId: string;
+  sectionId: string;
+  coordinate: { x: number; y: number } | null;
+  crackWidthMm: number | null;
+  detectionMethod: DetectionMethod | null;
+  imageSummary: string | null;
+  rectificationStatus: RectificationStatus | null;
+  verifiedAt: string | null;
+  attachmentIds: string[];
+  /** 该样本专门覆盖的语义边界标签 */
+  semanticTags: string[];
+}
+
+/** 单条样本的投影预期（参考实现口径，作为探针比对基准） */
+export interface BenchmarkExpectation {
+  defectId: string;
+  /** 预期该实体是否通过过滤（false 时消费方结果中必须缺省该实体） */
+  visible: boolean;
+  fields: {
+    fieldKey: string;
+    /** 预期机器值；null 表示语义空值，字符串 '<LOD' 表示低于检出限 */
+    expectedValue: number | string | null | { x: string; y: string };
+    expectedDisplay: string;
+    expectedUnit?: string;
+    /** 预期触发的语义原因码（below_detection_limit / null_meaning_preserved / rounded_to_contract_scale …） */
+    expectedReasonCodes: ReasonCode[];
+  }[];
+  /** 聚合预期：可见且可计入统计的裂缝宽度序列（null 与 <LOD 不得按 0 计入） */
+  aggregation: {
+    countableWidthsMm: number[];
+    expectedCount: number;
+    expectedSumMm: number;
+    expectedAvgMm: number | null;
+  };
+}
+
+/** 冻结的受控基准样本集（版本与契约/策略快照绑定） */
+export interface SemanticBenchmark {
+  benchmarkVersion: string;
+  /** 绑定的字段契约版本，版本不一致禁止回放/门禁 */
+  contractVersion: string;
+  /** 绑定的字段策略快照哈希（六维授权策略 + 字段契约注册表的冻结指纹） */
+  policyFingerprint: string;
+  createdAt: string;
+  /** 样本集规范化内容哈希：样本任何字节变化都会改变，用于冻结校验 */
+  benchmarkHash: string;
+  defects: BenchmarkDefect[];
+  expectations: BenchmarkExpectation[];
+}
+
+/** 消费方对单个样本字段的观测结果（探针收集项） */
+export interface FieldObservation {
+  defectId: string;
+  fieldKey: string;
+  /** 消费方实际输出；字段被过滤时应缺省（omitted=true） */
+  observedValue?: number | string | null | { x: string; y: string };
+  observedDisplay?: string;
+  observedUnit?: string;
+  /** 消费方声明的接收单位（用于单位换算不变量验证），默认契约基准单位 */
+  receivedUnit?: string;
+  omitted?: boolean;
+  /** 消费方自报的处理原因码（可选） */
+  reasonCodes?: ReasonCode[];
+}
+
+/** 消费方对整个样本集的结果摘要（探针输出） */
+export interface ObservationProbe {
+  probeId: string;
+  consumerId: string;
+  consumerName: string;
+  /** 回放所针对的样本版本，必须与门禁冻结的 benchmarkVersion 完全一致 */
+  benchmarkVersion: string;
+  benchmarkHash: string;
+  contractVersion: string;
+  ranAt: string;
+  observations: FieldObservation[];
+  /** 消费方自己算出的聚合摘要（用于聚合不变量验证） */
+  aggregationSummary?: {
+    countedAsZero: string[]; // 被消费方按 0 计入的缺陷ID（null / <LOD 误入即违规）
+    sumMm: number;
+    count: number;
+    avgMm: number | null;
+  };
+}
+
+/** 单条语义分歧（差异解释器输出，可定位到实体 × 字段 × 不变量） */
+export interface SemanticDivergence {
+  divergenceId: string;
+  kind: InvariantKind;
+  defectId: string;
+  fieldKey: string;
+  severity: 'blocker' | 'major' | 'minor';
+  expected: string;
+  observed: string;
+  explanation: string;
+  /** 修复指引 */
+  hint: string;
+}
+
+/** 探针与投影预期比对后的解释报告 */
+export interface ProbeReport {
+  probeId: string;
+  consumerId: string;
+  benchmarkVersion: string;
+  matched: boolean;
+  totalChecks: number;
+  passedChecks: number;
+  divergences: SemanticDivergence[];
+  /** 冻结绑定校验结论 */
+  binding: {
+    benchmarkVersionMatch: boolean;
+    benchmarkHashMatch: boolean;
+    contractVersionMatch: boolean;
+    policyFingerprintMatch: boolean;
+  };
+}
+
+/** 变形测试类别 */
+export type MetamorphicTransform = 'unit_scale' | 'equivalent_reorder' | 'missing_injection';
+
+/** 一次变形测试用例及其不变量断言结果 */
+export interface MetamorphicCase {
+  caseId: string;
+  transform: MetamorphicTransform;
+  title: string;
+  fieldKey: string;
+  /** 变形说明（施加了什么等价变换） */
+  description: string;
+  /** 断言的不变量类别 */
+  invariantKind: InvariantKind;
+  passed: boolean;
+  expected: string;
+  observed: string;
+  detail: string;
+}
+
+export interface MetamorphicSuiteReport {
+  suiteId: string;
+  benchmarkVersion: string;
+  contractVersion: string;
+  ranAt: string;
+  cases: MetamorphicCase[];
+  passed: boolean;
+}
+
+/** 差分回放报告：参考实现与消费方处理同一版本样本 */
+export interface ReplayReport {
+  replayId: string;
+  benchmarkVersion: string;
+  benchmarkHash: string;
+  contractVersion: string;
+  consumerId: string;
+  ranAt: string;
+  /** 参考实现（本平台投影编译器）的探针结果摘要 */
+  referenceProbe: ObservationProbe;
+  /** 消费方回传的探针结果摘要 */
+  consumerProbe: ObservationProbe;
+  probeReport: ProbeReport;
+  /** 冻结绑定不通过时为 false，且不得给出语义通过结论 */
+  bindingValid: boolean;
+}
+
+/** 门禁结论 */
+export type GateVerdict = 'pass' | 'delivery_hold';
+
+export interface SemanticGateCheck {
+  id: 'binding' | 'probe' | 'metamorphic' | 'unit-invariant' | 'null-invariant';
+  label: string;
+  status: 'pass' | 'fail' | 'warn';
+  detail: string;
+}
+
+/** 语义交付门禁报告：结构签名相同但语义不变量被违反时输出 delivery_hold（暂停交付） */
+export interface SemanticGateReport {
+  reportId: string;
+  ranAt: string;
+  benchmarkVersion: string;
+  benchmarkHash: string;
+  contractVersion: string;
+  policyFingerprint: string;
+  verdict: GateVerdict;
+  /** 暂停交付的具体原因（verdict=delivery_hold 时非空） */
+  holdReasons: string[];
+  checks: SemanticGateCheck[];
+  probeReports: ProbeReport[];
+  metamorphic: MetamorphicSuiteReport;
+  replay?: ReplayReport;
+}

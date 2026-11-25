@@ -11,6 +11,7 @@ import Review from './components/Review';
 import Receipts from './components/Receipts';
 import History from './components/History';
 import Contracts from './components/Contracts';
+import SemanticGate from './components/SemanticGate';
 import { Toggle } from './components/ui';
 
 const TABS: { key: TabKey; label: string; ico: string; title: string; crumb: string }[] = [
@@ -21,6 +22,7 @@ const TABS: { key: TabKey; label: string; ico: string; title: string; crumb: str
   { key: 'receipts', label: '回执账', ico: '🧾', title: '交付回执账本', crumb: '传输 / 解析 / 语义确认 / 质疑 / 更正 · 冲突裁定' },
   { key: 'history', label: '版本与审计', ico: '🕓', title: '修订链 · 审阅历史 · 审计账本', crumb: '签名修订1保留 · 审计摘要不随授权撤销消失' },
   { key: 'contracts', label: '契约与授权', ico: '📐', title: '字段契约与授权交集', crumb: '类型 / 单位 / 精度 / 检出限 / 空值 / 枚举 / 来源 / 角色' },
+  { key: 'semantic', label: '语义门禁', ico: '🛂', title: '语义行为契约与交付门禁', crumb: '不变量声明 · 冻结样本 · 探针 · 差分回放 · 变形测试 · 暂停交付' },
 ];
 
 function Toast() {
@@ -144,6 +146,7 @@ export default function App() {
           {s.tab === 'receipts' && <Receipts />}
           {s.tab === 'history' && <History />}
           {s.tab === 'contracts' && <Contracts />}
+          {s.tab === 'semantic' && <SemanticGate />}
         </main>
       </div>
       <Toast />
